@@ -31,8 +31,8 @@ The issue is still reproducible locally on systems running affected QEMU version
 Even without the QEMU hang bug, **cancelling a cross-platform `podman build` leaves orphaned QEMU processes running**. This was confirmed on every CI run.
 
 Filed issues:
-- **Buildah**: [containers/buildah#6786](https://github.com/containers/buildah/issues/6786) — signal handler has no timeout on state polling, no cgroup kill fallback
-- **Podman**: [containers/podman#28502](https://github.com/containers/podman/issues/28502) — client SIGINT doesn't cancel server-side build on podman machine
+- **Buildah**: [containers/buildah#6786](https://github.com/containers/buildah/issues/6786) — root cause: signal handler has no timeout on state polling, no cgroup kill fallback
+- **Podman**: [containers/podman#28502](https://github.com/containers/podman/issues/28502) — UX: podman should warn about surviving processes after cancellation on podman machine, even if buildah is the root cause
 
 ### What the cleanup-gap workflow demonstrates
 
@@ -50,7 +50,7 @@ PID 2687: /usr/bin/qemu-aarch64-static /bin/sleep 300  PPid: 2670  wchan: hrtime
 PID 2689: /usr/bin/qemu-aarch64-static /bin/sleep 300  PPid: 2670  wchan: hrtimer_nanosleep
 ```
 
-The `sigint-podman-remote` job also demonstrates the same gap via podman's systemd socket (simulating the podman machine client/server split on macOS).
+The `sigint-podman-remote` job demonstrates the same orphans via podman's systemd socket (simulating the podman machine client/server split on macOS). The orphans are caused by buildah's cleanup gap (containers/buildah#6786), not by podman failing to propagate cancellation. However, podman is the user-facing tool and silently returns to prompt without warning the user that processes may still be running inside the VM.
 
 ### Buildah code gap
 
@@ -147,6 +147,6 @@ gh workflow run cleanup-gap.yml
 
 - [QEMU #2738 — golang 1.23 build hangs when running under qemu-user on x86_64 host](https://gitlab.com/qemu-project/qemu/-/work_items/2738)
 - [containers/buildah#6786 — Build cancellation leaves orphaned QEMU processes](https://github.com/containers/buildah/issues/6786)
-- [containers/podman#28502 — SIGINT to podman build does not cancel server-side build on podman machine](https://github.com/containers/podman/issues/28502)
+- [containers/podman#28502 — podman build should warn about surviving processes after cancellation on podman machine](https://github.com/containers/podman/issues/28502)
 - [Buildah run_common.go — signal handling without timeout](https://github.com/containers/buildah/blob/main/run_common.go#L656-L705)
 - [Workaround: kill-stuck-qemu shell function](https://github.com/kaovilai/dotfiles/blob/main/zsh/functions/podman-utils.zsh#L63)
