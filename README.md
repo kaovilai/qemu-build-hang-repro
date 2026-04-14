@@ -2,7 +2,7 @@
 
 ## Problem
 
-When building container images for foreign architectures (e.g., `linux/arm64` on an `x86_64` host), QEMU user-mode emulation processes can hang indefinitely due to an eventfd emulation bug ([QEMU #2738](https://gitlab.com/qemu-project/qemu/-/work_items/2738)). This affects any tool that uses QEMU binfmt_misc for cross-platform builds, including `podman build --platform`, `docker buildx`, and direct `buildah` usage.
+When building container images for foreign architectures (e.g., `linux/arm64` on an `x86_64` host), QEMU user-mode emulation processes can hang indefinitely due to an eventfd emulation bug ([QEMU #2738](https://gitlab.com/qemu-project/qemu/-/work_items/2738)). This affects any tool that uses QEMU binfmt_misc for cross-platform builds, including `podman build --platform` and direct `buildah` usage.
 
 The hung processes enter **uninterruptible sleep** (`D` state), making them immune to `SIGTERM` and `SIGKILL`. After the user cancels the build (Ctrl+C), these zombie QEMU processes persist and consume resources indefinitely.
 
@@ -87,8 +87,8 @@ This repo includes a GitHub Actions workflow that demonstrates the hang. It buil
 
 ### What the repro does
 
-1. Sets up QEMU user-mode emulation via `docker/setup-qemu-action`
-2. Builds a multi-stage Dockerfile that compiles Go 1.23 code for `linux/arm64`
+1. Sets up QEMU user-mode emulation via binfmt_misc registration
+2. Builds a multi-stage Containerfile that compiles Go 1.23 code for `linux/arm64` using `podman build`
 3. The Go compilation triggers the eventfd deadlock in QEMU
 4. A 5-minute timeout prevents the runner from hanging forever
 
@@ -96,7 +96,7 @@ This repo includes a GitHub Actions workflow that demonstrates the hang. It buil
 
 ```bash
 # On macOS with podman machine (x86_64 or arm64 host building for the other arch)
-podman build --platform linux/arm64 -f Dockerfile.repro .
+podman build --platform linux/arm64 -f Containerfile.repro .
 
 # After Ctrl+C, check for stuck processes:
 podman machine ssh -- ps aux | grep qemu
