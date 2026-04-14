@@ -6,10 +6,14 @@ on:
     branches: [main]
 
 jobs:
-  # Go 1.23 on foreign arch — expected to HANG (timeout enforced)
+  # Race condition — spawn multiple concurrent builds to increase hit probability
   go123-arm64-hang:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -18,13 +22,12 @@ jobs:
           sudo podman run --rm --privileged \
             multiarch/qemu-user-static --reset -p yes
 
-      - name: "Build Go 1.23 for linux/arm64 (EXPECTED TO HANG)"
-        id: build
+      - name: "Build Go 1.23 for linux/arm64 — attempt ${{ matrix.attempt }}"
         continue-on-error: true
         run: |
-          echo "::warning::This build is expected to hang due to QEMU eventfd bug."
-          echo "::warning::A 3-minute timeout will cancel it."
+          echo "::warning::Attempt ${{ matrix.attempt }}/5 — race condition may or may not trigger."
           timeout 180 podman build \
+            --no-cache \
             --platform linux/arm64 \
             -f Containerfile.repro \
             . 2>&1 || echo "BUILD_EXIT_CODE=$?" >> "$GITHUB_ENV"
@@ -32,22 +35,62 @@ jobs:
       - name: Report result
         run: |
           if [ "${BUILD_EXIT_CODE}" = "124" ]; then
-            echo "::error::Build timed out after 3 minutes — QEMU hang confirmed."
-            echo "## Result: HANG CONFIRMED" >> "$GITHUB_STEP_SUMMARY"
-            echo "Go 1.23 cross-compilation for arm64 hung under QEMU user-mode emulation." >> "$GITHUB_STEP_SUMMARY"
-            echo "The build was killed after 3 minutes by \`timeout\`." >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "This demonstrates [QEMU #2738](https://gitlab.com/qemu-project/qemu/-/work_items/2738)." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Attempt ${{ matrix.attempt }}: timed out — QEMU hang confirmed."
+            echo "## Attempt ${{ matrix.attempt }}: HANG CONFIRMED" >> "$GITHUB_STEP_SUMMARY"
+            echo "QEMU eventfd race triggered. Build killed after 3 minutes." >> "$GITHUB_STEP_SUMMARY"
+            echo "[QEMU #2738](https://gitlab.com/qemu-project/qemu/-/work_items/2738)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           elif [ "${BUILD_EXIT_CODE}" = "" ] || [ "${BUILD_EXIT_CODE}" = "0" ]; then
-            echo "::notice::Build succeeded — QEMU may have fixed the bug in this runner's version."
-            echo "## Result: BUILD SUCCEEDED" >> "$GITHUB_STEP_SUMMARY"
-            echo "The QEMU version on this runner may have the fix." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::Attempt ${{ matrix.attempt }}: succeeded — race not triggered this time."
+            echo "## Attempt ${{ matrix.attempt }}: PASSED" >> "$GITHUB_STEP_SUMMARY"
+            echo "Race condition did not trigger. QEMU version may have the fix." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::error::Build failed with exit code ${BUILD_EXIT_CODE}"
-            echo "## Result: BUILD FAILED (exit code ${BUILD_EXIT_CODE})" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Attempt ${{ matrix.attempt }}: failed with exit code ${BUILD_EXIT_CODE}"
+            echo "## Attempt ${{ matrix.attempt }}: FAILED (exit ${BUILD_EXIT_CODE})" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  # Go 1.22 on same foreign arch — expected to SUCCEED (control)
+  # Also try with older QEMU (9.2.0) pinned — more likely to trigger
+  go123-arm64-old-qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU 9.2.0 (known-affected version)
+        run: |
+          sudo podman run --rm --privileged \
+            multiarch/qemu-user-static:9.2.0-2 --reset -p yes
+
+      - name: "Build Go 1.23 for linux/arm64 — old QEMU attempt ${{ matrix.attempt }}"
+        continue-on-error: true
+        run: |
+          echo "::warning::Using QEMU 9.2.0 (known-affected). Attempt ${{ matrix.attempt }}/3."
+          timeout 180 podman build \
+            --no-cache \
+            --platform linux/arm64 \
+            -f Containerfile.repro \
+            . 2>&1 || echo "BUILD_EXIT_CODE=$?" >> "$GITHUB_ENV"
+
+      - name: Report result
+        run: |
+          if [ "${BUILD_EXIT_CODE}" = "124" ]; then
+            echo "::error::Attempt ${{ matrix.attempt }} (QEMU 9.2.0): timed out — HANG CONFIRMED."
+            echo "## Old QEMU attempt ${{ matrix.attempt }}: HANG CONFIRMED" >> "$GITHUB_STEP_SUMMARY"
+            echo "QEMU 9.2.0 eventfd race triggered." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          elif [ "${BUILD_EXIT_CODE}" = "" ] || [ "${BUILD_EXIT_CODE}" = "0" ]; then
+            echo "::notice::Attempt ${{ matrix.attempt }} (QEMU 9.2.0): succeeded."
+            echo "## Old QEMU attempt ${{ matrix.attempt }}: PASSED" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Attempt ${{ matrix.attempt }} (QEMU 9.2.0): exit code ${BUILD_EXIT_CODE}"
+            echo "## Old QEMU attempt ${{ matrix.attempt }}: FAILED (exit ${BUILD_EXIT_CODE})" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # Control: Go 1.22 on same foreign arch — should always succeed
   go122-arm64-control:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -61,7 +104,6 @@ jobs:
 
       - name: "Build Go 1.22 for linux/arm64 (EXPECTED TO SUCCEED)"
         run: |
-          echo "::notice::Go 1.22 should build fine — no eventfd issue."
           podman build \
             --platform linux/arm64 \
             -f Containerfile.repro-go1.22 \
@@ -70,11 +112,10 @@ jobs:
       - name: Report result
         if: success()
         run: |
-          echo "## Result: CONTROL PASSED" >> "$GITHUB_STEP_SUMMARY"
-          echo "Go 1.22 cross-compilation for arm64 completed successfully." >> "$GITHUB_STEP_SUMMARY"
-          echo "This confirms the issue is specific to Go 1.23+ under QEMU." >> "$GITHUB_STEP_SUMMARY"
+          echo "## CONTROL: Go 1.22 PASSED" >> "$GITHUB_STEP_SUMMARY"
+          echo "Go 1.22 cross-compilation completed. Issue is Go 1.23+ specific." >> "$GITHUB_STEP_SUMMARY"
 
-  # Native arch — expected to SUCCEED (proves Go 1.23 itself is fine)
+  # Control: Native arch — should always succeed
   go123-native-control:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -83,7 +124,6 @@ jobs:
 
       - name: "Build Go 1.23 for linux/amd64 (native, EXPECTED TO SUCCEED)"
         run: |
-          echo "::notice::Native arch build — no QEMU involved."
           podman build \
             --platform linux/amd64 \
             -f Containerfile.repro \
@@ -92,6 +132,5 @@ jobs:
       - name: Report result
         if: success()
         run: |
-          echo "## Result: NATIVE CONTROL PASSED" >> "$GITHUB_STEP_SUMMARY"
-          echo "Go 1.23 builds fine on native amd64 — no QEMU, no hang." >> "$GITHUB_STEP_SUMMARY"
-          echo "This confirms the issue is QEMU-specific, not a Go bug." >> "$GITHUB_STEP_SUMMARY"
+          echo "## CONTROL: Native amd64 PASSED" >> "$GITHUB_STEP_SUMMARY"
+          echo "Go 1.23 builds fine without QEMU. Issue is QEMU-specific." >> "$GITHUB_STEP_SUMMARY"
