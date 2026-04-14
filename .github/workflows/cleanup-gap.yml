@@ -1,3 +1,37 @@
+# =============================================================================
+# Buildah Cleanup Gap Demo
+# =============================================================================
+#
+# PURPOSE:
+#   Demonstrates that cancelling `podman build` (Ctrl+C / SIGINT) during a
+#   cross-platform build leaves orphaned qemu-*-static processes running.
+#
+# WHY THIS MATTERS:
+#   On macOS, `podman build` runs via podman machine — a Linux VM. When the
+#   user presses Ctrl+C, the host-side `podman` CLI exits, but the server-side
+#   `buildah` and `qemu-*-static` processes inside the VM keep running.
+#   The user has no visibility into these orphans unless they manually
+#   `podman machine ssh` and hunt for them.
+#
+# WHAT TO LOOK FOR IN THE RESULTS:
+#   - "CLEANUP GAP CONFIRMED" = orphaned processes survived after SIGINT
+#   - Check the "Processes AFTER SIGINT" section for qemu-aarch64-static
+#     processes with PPid=1 (reparented to init — their parent died)
+#   - The "Orphan process details" shows wchan (what kernel function they're
+#     blocked on) and process state
+#
+# ROOT CAUSE IN BUILDAH:
+#   containers/buildah/run_common.go lines 656-705:
+#   - Signal handler sends SIGKILL via OCI runtime, then polls container state
+#     every 100ms with NO TIMEOUT. If the container process doesn't die (e.g.
+#     QEMU in D-state), the loop runs forever.
+#   - No cgroup-level kill fallback exists.
+#
+# RELATED:
+#   - QEMU #2738: https://gitlab.com/qemu-project/qemu/-/work_items/2738
+#   - Workaround: https://github.com/kaovilai/dotfiles/blob/main/zsh/functions/podman-utils.zsh#L63
+# =============================================================================
+
 name: Buildah Cleanup Gap Demo
 
 on:
@@ -6,7 +40,12 @@ on:
     branches: [main]
 
 jobs:
-  # Demo: SIGINT during cross-platform podman build leaves orphaned processes
+  # ===========================================================================
+  # Job 1: Direct podman build — SIGINT leaves orphaned QEMU processes
+  # ===========================================================================
+  # EXPECTED: After killing podman build, qemu-aarch64-static processes
+  # remain running with PPid=1 (reparented to init). This proves buildah
+  # does not clean up container processes when the build is cancelled.
   sigint-leaves-orphans:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -18,94 +57,200 @@ jobs:
           sudo podman run --rm --privileged \
             multiarch/qemu-user-static --reset -p yes
 
-      - name: Snapshot processes before build
+      # -----------------------------------------------------------------------
+      # Baseline: confirm no qemu/buildah processes exist before we start
+      # -----------------------------------------------------------------------
+      - name: "Baseline: verify no QEMU/buildah processes exist yet"
         run: |
-          ps -eo pid,ppid,stat,wchan,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep > /tmp/before.txt || true
-          echo "### Processes before build:" >> "$GITHUB_STEP_SUMMARY"
+          echo "=== BASELINE CHECK ==="
+          echo "Before starting any build, there should be zero qemu/buildah processes."
+          echo "This proves any processes found later were created by our build."
+          echo ""
+          BEFORE=$(ps -eo pid,ppid,stat,wchan,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep || true)
+          if [ -z "$BEFORE" ]; then
+            echo "GOOD: No qemu/buildah/conmon/crun/sleep processes found."
+          else
+            echo "UNEXPECTED: Found pre-existing processes:"
+            echo "$BEFORE"
+          fi
+          echo ""
+          echo "### Baseline (before build):" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat /tmp/before.txt >> "$GITHUB_STEP_SUMMARY" || echo "(none)" >> "$GITHUB_STEP_SUMMARY"
+          echo "${BEFORE:-(none)}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Start cross-platform build, then SIGINT it
+      # -----------------------------------------------------------------------
+      # Start a cross-platform build, wait for it to enter the RUN step,
+      # then simulate Ctrl+C by sending SIGINT → SIGTERM → SIGKILL
+      # -----------------------------------------------------------------------
+      - name: "Start cross-platform build, wait for RUN step, then Ctrl+C it"
         run: |
-          echo "--- Starting podman build in background ---"
+          echo "============================================================"
+          echo "WHAT THIS STEP DOES:"
+          echo "  1. Start 'podman build --platform linux/arm64' in background"
+          echo "  2. Wait 15s for build to pull image and enter RUN step"
+          echo "  3. Send SIGINT (same as Ctrl+C) to podman build"
+          echo "  4. Wait 2s, send SIGTERM"
+          echo "  5. Wait 2s, check if still alive, send SIGKILL if needed"
+          echo ""
+          echo "EXPECTED: podman build exits, but child qemu-aarch64-static"
+          echo "processes inside the build container keep running as orphans."
+          echo "============================================================"
+          echo ""
+
+          echo ">>> Starting podman build in background..."
           podman build \
             --no-cache \
             --platform linux/arm64 \
             -f Containerfile.cleanup-test \
             . &
           BUILD_PID=$!
-          echo "podman build PID: $BUILD_PID"
+          echo "    podman build PID: $BUILD_PID"
+          echo ""
 
-          # Wait for build to enter RUN step
-          echo "--- Waiting 15s for build to reach RUN step ---"
+          echo ">>> Waiting 15s for build to reach RUN step..."
+          echo "    (Containerfile.cleanup-test spawns 4x 'sleep 300' under QEMU)"
           sleep 15
+          echo ""
 
-          echo "--- Sending SIGINT to podman build (PID $BUILD_PID) ---"
+          echo ">>> Sending SIGINT to podman build (PID $BUILD_PID)..."
+          echo "    (This is what happens when user presses Ctrl+C)"
           kill -SIGINT "$BUILD_PID" 2>/dev/null || true
           sleep 2
 
-          echo "--- Sending SIGTERM to podman build (PID $BUILD_PID) ---"
+          echo ">>> Sending SIGTERM to podman build (PID $BUILD_PID)..."
           kill -SIGTERM "$BUILD_PID" 2>/dev/null || true
           sleep 2
 
-          echo "--- Checking if podman build still alive ---"
+          echo ">>> Checking if podman build process is still alive..."
           if kill -0 "$BUILD_PID" 2>/dev/null; then
+            echo "    WARNING: podman build still alive after SIGINT+SIGTERM!"
+            echo "    Sending SIGKILL as last resort..."
             echo "::warning::podman build still alive after SIGINT+SIGTERM. Sending SIGKILL."
             kill -SIGKILL "$BUILD_PID" 2>/dev/null || true
           else
-            echo "podman build exited."
+            echo "    podman build process exited (as expected)."
           fi
 
-          # Give cleanup a moment
+          # Give any deferred cleanup a moment to run
           sleep 3
           wait "$BUILD_PID" 2>/dev/null || true
+          echo ""
+          echo ">>> podman build is gone. Now let's check what's still running..."
 
-      - name: Check for orphaned processes after SIGINT
+      # -----------------------------------------------------------------------
+      # THE KEY CHECK: are qemu/buildah processes still alive?
+      # If yes, that's the cleanup gap — buildah didn't reap its children.
+      # -----------------------------------------------------------------------
+      - name: "CHECK: Are orphaned processes still running after SIGINT?"
         run: |
+          echo "============================================================"
+          echo "KEY QUESTION: Did killing podman build also kill the QEMU"
+          echo "processes it spawned inside the build container?"
+          echo ""
+          echo "If orphans exist, it proves buildah does not properly clean"
+          echo "up child processes when a build is cancelled."
+          echo ""
+          echo "On macOS/podman machine, these orphans persist inside the VM"
+          echo "with no host-side visibility. The user must manually SSH in."
+          echo "============================================================"
+          echo ""
+
+          echo ">>> Scanning for surviving qemu/buildah/conmon/crun processes..."
+          echo ""
+          SURVIVORS=$(ps -eo pid,ppid,stat,wchan,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep || true)
+
           echo "### Processes AFTER SIGINT:" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          ps -eo pid,ppid,stat,wchan,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep | tee -a "$GITHUB_STEP_SUMMARY" || echo "(none)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "${SURVIVORS:-(none)}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-          # Count orphans
+          if [ -n "$SURVIVORS" ]; then
+            echo "$SURVIVORS"
+          else
+            echo "(none found)"
+          fi
+          echo ""
+
+          # Count orphans (exclude 'sleep' from count — focus on qemu/buildah/conmon/crun)
           ORPHAN_COUNT=$(ps -eo pid,ppid,stat,wchan,args | grep -E 'qemu|buildah|conmon|crun' | grep -v grep | wc -l)
+
           if [ "$ORPHAN_COUNT" -gt 0 ]; then
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "  CLEANUP GAP CONFIRMED: $ORPHAN_COUNT orphaned process(es)"
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo ""
+            echo "These processes survived SIGINT + SIGTERM + SIGKILL to"
+            echo "the podman build process. They are now reparented to PID 1"
+            echo "(init) and will run until manually killed or the system"
+            echo "shuts down."
+            echo ""
+            echo "On macOS with podman machine, this means:"
+            echo "  - 'podman build' on host exits cleanly"
+            echo "  - qemu-*-static processes persist inside the VM"
+            echo "  - User sees no error, no warning"
+            echo "  - VM resources consumed silently"
+            echo "  - Must 'podman machine ssh' to discover and kill them"
+            echo ""
+
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "## CLEANUP GAP CONFIRMED" >> "$GITHUB_STEP_SUMMARY"
-            echo "**$ORPHAN_COUNT orphaned process(es)** survived SIGINT → SIGTERM → SIGKILL to podman build." >> "$GITHUB_STEP_SUMMARY"
+            echo "**$ORPHAN_COUNT orphaned process(es)** survived SIGINT -> SIGTERM -> SIGKILL to podman build." >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "On macOS/podman machine, these would persist inside the VM." >> "$GITHUB_STEP_SUMMARY"
             echo "User must manually \`podman machine ssh\` and kill them." >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "**Gap location**: [\`containers/buildah/run_common.go:656-705\`](https://github.com/containers/buildah/blob/main/run_common.go#L656-L705)" >> "$GITHUB_STEP_SUMMARY"
-            echo "— state polling loop has no timeout, no cgroup kill fallback." >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::$ORPHAN_COUNT orphaned processes found after build cancellation."
+            echo "-- state polling loop has no timeout, no cgroup kill fallback." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::CLEANUP GAP: $ORPHAN_COUNT orphaned processes found after build cancellation."
 
             echo ""
             echo "--- Orphan process details ---"
             for pid in $(ps -eo pid,args | grep -E 'qemu|buildah|conmon|crun' | grep -v grep | awk '{print $1}'); do
-              echo "PID $pid:"
-              cat "/proc/$pid/wchan" 2>/dev/null && echo "" || echo "  wchan: N/A"
-              cat "/proc/$pid/status" 2>/dev/null | grep -E '^(Name|State|PPid|Threads)' || true
-              echo "---"
+              echo ""
+              echo "  PID $pid:"
+              WCHAN=$(cat "/proc/$pid/wchan" 2>/dev/null || echo "N/A")
+              echo "    wchan: $WCHAN  (kernel function this process is blocked on)"
+              cat "/proc/$pid/status" 2>/dev/null | grep -E '^(Name|State|PPid|Threads)' | sed 's/^/    /' || true
+              PPID_VAL=$(cat "/proc/$pid/status" 2>/dev/null | grep '^PPid' | awk '{print $2}')
+              if [ "$PPID_VAL" = "1" ]; then
+                echo "    ^^^ PPid=1 means parent died and process was reparented to init"
+              fi
             done
+            echo ""
           else
+            echo "No orphans found — cleanup worked on this run."
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "## NO ORPHANS FOUND" >> "$GITHUB_STEP_SUMMARY"
             echo "All processes cleaned up after SIGINT. Cleanup worked on this run." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Force cleanup remaining processes
+      - name: "Cleanup: force-kill any remaining processes"
         if: always()
         run: |
-          # Kill anything left
-          for pid in $(ps -eo pid,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep | awk '{print $1}'); do
-            echo "Force killing orphan PID $pid"
-            sudo kill -9 "$pid" 2>/dev/null || true
-          done
+          PIDS=$(ps -eo pid,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep | awk '{print $1}' || true)
+          if [ -n "$PIDS" ]; then
+            echo "Force-killing remaining orphan processes..."
+            for pid in $PIDS; do
+              echo "  kill -9 PID $pid"
+              sudo kill -9 "$pid" 2>/dev/null || true
+            done
+            echo "Done."
+          else
+            echo "No remaining processes to clean up."
+          fi
 
-  # Same test but with podman remote (simulates podman machine architecture)
+  # ===========================================================================
+  # Job 2: podman --remote build — simulates podman machine on macOS
+  # ===========================================================================
+  # On macOS, `podman` CLI talks to podman machine VM over a unix socket.
+  # When the CLI is killed (Ctrl+C), the server-side `buildah` process may
+  # or may not receive a cancellation signal. This test uses podman's systemd
+  # socket to simulate that client/server split.
+  #
+  # EXPECTED: After killing the podman --remote client, server-side
+  # qemu-aarch64-static processes persist — the API server does not propagate
+  # cancellation to the build's child processes.
   sigint-podman-remote:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -117,61 +262,143 @@ jobs:
           sudo podman run --rm --privileged \
             multiarch/qemu-user-static --reset -p yes
 
-      - name: Set up podman remote via systemd socket
+      # -----------------------------------------------------------------------
+      # Set up podman remote — this simulates the macOS podman machine
+      # architecture where CLI (host) talks to server (VM) over unix socket
+      # -----------------------------------------------------------------------
+      - name: "Setup: enable podman remote socket (simulates podman machine)"
         run: |
-          # Enable podman socket — simulates podman machine's remote architecture
+          echo "============================================================"
+          echo "WHAT THIS DOES:"
+          echo "  On macOS, 'podman build' actually runs as:"
+          echo "    podman CLI (host) --socket--> podman server (VM)"
+          echo ""
+          echo "  We simulate this by enabling the podman systemd socket"
+          echo "  and using 'podman --remote' to talk to it."
+          echo ""
+          echo "  This is the architecture where the cleanup gap is worst:"
+          echo "  killing the client does NOT automatically kill server-side"
+          echo "  processes."
+          echo "============================================================"
+          echo ""
           systemctl --user enable --now podman.socket
           export CONTAINER_HOST=unix://$(podman info --format '{{.Host.RemoteSocket.Path}}')
           echo "CONTAINER_HOST=$CONTAINER_HOST" >> "$GITHUB_ENV"
           echo "Podman remote socket: $CONTAINER_HOST"
           podman --remote info | head -5
 
-      - name: Start remote cross-platform build, then SIGINT it
+      # -----------------------------------------------------------------------
+      # Same pattern: start build, wait, SIGINT the client
+      # -----------------------------------------------------------------------
+      - name: "Start remote build, wait for RUN step, then Ctrl+C the client"
         run: |
-          echo "--- Starting podman --remote build in background ---"
+          echo "============================================================"
+          echo "WHAT THIS STEP DOES:"
+          echo "  1. Start 'podman --remote build --platform linux/arm64'"
+          echo "  2. Wait 15s for build to enter RUN step"
+          echo "  3. Send SIGINT to the podman --remote CLIENT process"
+          echo "  4. Check if server-side processes survive"
+          echo ""
+          echo "KEY DIFFERENCE FROM JOB 1:"
+          echo "  Here we kill the CLIENT, not the server. On macOS, Ctrl+C"
+          echo "  only kills the host-side 'podman' CLI. The VM-side 'buildah'"
+          echo "  and 'qemu-*-static' processes may keep running indefinitely."
+          echo "============================================================"
+          echo ""
+
+          echo ">>> Starting podman --remote build in background..."
           podman --remote build \
             --no-cache \
             --platform linux/arm64 \
             -f Containerfile.cleanup-test \
             . &
           BUILD_PID=$!
-          echo "podman --remote build PID: $BUILD_PID"
+          echo "    podman --remote client PID: $BUILD_PID"
+          echo ""
 
-          echo "--- Waiting 15s for build to reach RUN step ---"
+          echo ">>> Waiting 15s for build to reach RUN step..."
           sleep 15
+          echo ""
 
-          echo "--- Sending SIGINT (Ctrl+C equivalent) ---"
+          echo ">>> Sending SIGINT to podman --remote CLIENT (PID $BUILD_PID)..."
+          echo "    (This simulates user pressing Ctrl+C on macOS host)"
           kill -SIGINT "$BUILD_PID" 2>/dev/null || true
           sleep 3
 
-          echo "--- Checking if podman --remote build still alive ---"
+          echo ">>> Checking if client process is still alive..."
           if kill -0 "$BUILD_PID" 2>/dev/null; then
-            echo "::warning::podman --remote build still alive after SIGINT."
+            echo "    Client still alive after SIGINT. Escalating..."
+            echo "::warning::podman --remote client still alive after SIGINT."
             kill -SIGTERM "$BUILD_PID" 2>/dev/null || true
             sleep 2
             kill -SIGKILL "$BUILD_PID" 2>/dev/null || true
+          else
+            echo "    Client exited (expected)."
           fi
 
           sleep 3
           wait "$BUILD_PID" 2>/dev/null || true
+          echo ""
+          echo ">>> Client is gone. Now checking SERVER side for orphans..."
 
-      - name: Check for orphaned processes on server side
+      # -----------------------------------------------------------------------
+      # THE KEY CHECK: did the server-side processes survive?
+      # -----------------------------------------------------------------------
+      - name: "CHECK: Are server-side processes still running after client SIGINT?"
         run: |
+          echo "============================================================"
+          echo "KEY QUESTION: When the podman CLI client is killed, does the"
+          echo "server (API/buildah) also clean up its child processes?"
+          echo ""
+          echo "This simulates what happens inside podman machine VM on macOS"
+          echo "when user presses Ctrl+C on host-side 'podman build'."
+          echo "============================================================"
+          echo ""
+
+          echo ">>> Scanning for server-side qemu/buildah/podman processes..."
+          echo ""
+          SURVIVORS=$(ps -eo pid,ppid,stat,wchan,args | grep -E 'qemu|buildah|conmon|crun|sleep|podman' | grep -v grep || true)
+
           echo "### Server-side processes AFTER client SIGINT:" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "This simulates what happens inside podman machine VM on macOS" >> "$GITHUB_STEP_SUMMARY"
           echo "when user presses Ctrl+C on host-side \`podman build\`." >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          ps -eo pid,ppid,stat,wchan,args | grep -E 'qemu|buildah|conmon|crun|sleep|podman' | grep -v grep | tee -a "$GITHUB_STEP_SUMMARY" || echo "(none)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "${SURVIVORS:-(none)}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-          # Check for server-side buildah processes specifically
+          if [ -n "$SURVIVORS" ]; then
+            echo "$SURVIVORS"
+          else
+            echo "(none found)"
+          fi
+          echo ""
+
           BUILDAH_COUNT=$(ps -eo args | grep -c '[b]uildah' || true)
           QEMU_COUNT=$(ps -eo args | grep -c '[q]emu' || true)
+          TOTAL=$((BUILDAH_COUNT + QEMU_COUNT))
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$BUILDAH_COUNT" -gt 0 ] || [ "$QEMU_COUNT" -gt 0 ]; then
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo "  REMOTE CLEANUP GAP CONFIRMED"
+            echo "  Server-side orphans: $BUILDAH_COUNT buildah + $QEMU_COUNT qemu"
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            echo ""
+            echo "The podman CLI client exited, but the server kept running"
+            echo "buildah and/or qemu-*-static processes."
+            echo ""
+            echo "On macOS with podman machine, this means:"
+            echo "  1. User presses Ctrl+C during 'podman build --platform ...'"
+            echo "  2. Terminal returns to prompt — looks like it stopped"
+            echo "  3. Inside VM: buildah + qemu still running, consuming CPU/RAM"
+            echo "  4. No warning shown to user"
+            echo "  5. User must 'podman machine ssh' to discover and kill them"
+            echo ""
+            echo "Workaround: https://github.com/kaovilai/dotfiles/blob/main/zsh/functions/podman-utils.zsh#L63"
+            echo ""
+
             echo "## REMOTE CLEANUP GAP CONFIRMED" >> "$GITHUB_STEP_SUMMARY"
             echo "**Server-side orphans**: $BUILDAH_COUNT buildah, $QEMU_COUNT qemu processes." >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -181,15 +408,24 @@ jobs:
             echo "- User must \`podman machine ssh\` to find and kill them" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Workaround: [kill-stuck-qemu](https://github.com/kaovilai/dotfiles/blob/main/zsh/functions/podman-utils.zsh#L63)" >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Server-side orphans: $BUILDAH_COUNT buildah + $QEMU_COUNT qemu"
+            echo "::error::REMOTE CLEANUP GAP: $BUILDAH_COUNT buildah + $QEMU_COUNT qemu orphans on server side"
           else
+            echo "No server-side orphans found — cleanup worked on this run."
             echo "## NO SERVER-SIDE ORPHANS" >> "$GITHUB_STEP_SUMMARY"
             echo "Server cleaned up. Signal propagation worked on this run." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Force cleanup
+      - name: "Cleanup: force-kill any remaining processes"
         if: always()
         run: |
-          for pid in $(ps -eo pid,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep | awk '{print $1}'); do
-            sudo kill -9 "$pid" 2>/dev/null || true
-          done
+          PIDS=$(ps -eo pid,args | grep -E 'qemu|buildah|conmon|crun|sleep' | grep -v grep | awk '{print $1}' || true)
+          if [ -n "$PIDS" ]; then
+            echo "Force-killing remaining orphan processes..."
+            for pid in $PIDS; do
+              echo "  kill -9 PID $pid"
+              sudo kill -9 "$pid" 2>/dev/null || true
+            done
+            echo "Done."
+          else
+            echo "No remaining processes to clean up."
+          fi
