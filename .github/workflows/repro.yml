@@ -22,6 +22,11 @@ jobs:
           sudo podman run --rm --privileged \
             multiarch/qemu-user-static --reset -p yes
 
+      - name: Show QEMU version
+        run: |
+          podman run --rm --platform linux/arm64 golang:1.23 \
+            sh -c 'cat /proc/self/maps 2>/dev/null | head -1; uname -m' || true
+
       - name: "Build Go 1.23 for linux/arm64 — attempt ${{ matrix.attempt }}"
         continue-on-error: true
         run: |
@@ -47,47 +52,6 @@ jobs:
           else
             echo "::error::Attempt ${{ matrix.attempt }}: failed with exit code ${BUILD_EXIT_CODE}"
             echo "## Attempt ${{ matrix.attempt }}: FAILED (exit ${BUILD_EXIT_CODE})" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-  # Also try with older QEMU (9.2.0) pinned — more likely to trigger
-  go123-arm64-old-qemu:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        attempt: [1, 2, 3]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up QEMU 9.2.0 (known-affected version)
-        run: |
-          sudo podman run --rm --privileged \
-            multiarch/qemu-user-static:9.2.0-2 --reset -p yes
-
-      - name: "Build Go 1.23 for linux/arm64 — old QEMU attempt ${{ matrix.attempt }}"
-        continue-on-error: true
-        run: |
-          echo "::warning::Using QEMU 9.2.0 (known-affected). Attempt ${{ matrix.attempt }}/3."
-          timeout 180 podman build \
-            --no-cache \
-            --platform linux/arm64 \
-            -f Containerfile.repro \
-            . 2>&1 || echo "BUILD_EXIT_CODE=$?" >> "$GITHUB_ENV"
-
-      - name: Report result
-        run: |
-          if [ "${BUILD_EXIT_CODE}" = "124" ]; then
-            echo "::error::Attempt ${{ matrix.attempt }} (QEMU 9.2.0): timed out — HANG CONFIRMED."
-            echo "## Old QEMU attempt ${{ matrix.attempt }}: HANG CONFIRMED" >> "$GITHUB_STEP_SUMMARY"
-            echo "QEMU 9.2.0 eventfd race triggered." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          elif [ "${BUILD_EXIT_CODE}" = "" ] || [ "${BUILD_EXIT_CODE}" = "0" ]; then
-            echo "::notice::Attempt ${{ matrix.attempt }} (QEMU 9.2.0): succeeded."
-            echo "## Old QEMU attempt ${{ matrix.attempt }}: PASSED" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::error::Attempt ${{ matrix.attempt }} (QEMU 9.2.0): exit code ${BUILD_EXIT_CODE}"
-            echo "## Old QEMU attempt ${{ matrix.attempt }}: FAILED (exit ${BUILD_EXIT_CODE})" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # Control: Go 1.22 on same foreign arch — should always succeed
