@@ -1,0 +1,12 @@
+# Control: Go 1.22 does NOT hang under QEMU user-mode emulation.
+# Build with: docker buildx build --platform linux/arm64 -f Dockerfile.repro-go1.22 .
+
+FROM golang:1.22 AS builder
+
+WORKDIR /app
+COPY main.go .
+RUN go build -o /app/hello main.go
+
+FROM scratch
+COPY --from=builder /app/hello /hello
+ENTRYPOINT ["/hello"]

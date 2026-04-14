@@ -1,0 +1,105 @@
+name: QEMU Build Hang Repro
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  # Go 1.23 on foreign arch — expected to HANG (timeout enforced)
+  go123-arm64-hang:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU user-mode emulation
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Build Go 1.23 for linux/arm64 (EXPECTED TO HANG)"
+        id: build
+        continue-on-error: true
+        run: |
+          echo "::warning::This build is expected to hang due to QEMU eventfd bug."
+          echo "::warning::A 3-minute timeout will cancel it."
+          timeout 180 docker buildx build \
+            --platform linux/arm64 \
+            -f Dockerfile.repro \
+            --progress=plain \
+            . 2>&1 || echo "BUILD_EXIT_CODE=$?" >> "$GITHUB_ENV"
+
+      - name: Report result
+        run: |
+          if [ "${BUILD_EXIT_CODE}" = "124" ]; then
+            echo "::error::Build timed out after 3 minutes — QEMU hang confirmed."
+            echo "## Result: HANG CONFIRMED" >> "$GITHUB_STEP_SUMMARY"
+            echo "Go 1.23 cross-compilation for arm64 hung under QEMU user-mode emulation." >> "$GITHUB_STEP_SUMMARY"
+            echo "The build was killed after 3 minutes by \`timeout\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "This demonstrates [QEMU #2738](https://gitlab.com/qemu-project/qemu/-/work_items/2738)." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${BUILD_EXIT_CODE}" = "" ] || [ "${BUILD_EXIT_CODE}" = "0" ]; then
+            echo "::notice::Build succeeded — QEMU may have fixed the bug in this runner's version."
+            echo "## Result: BUILD SUCCEEDED" >> "$GITHUB_STEP_SUMMARY"
+            echo "The QEMU version on this runner may have the fix." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Build failed with exit code ${BUILD_EXIT_CODE}"
+            echo "## Result: BUILD FAILED (exit code ${BUILD_EXIT_CODE})" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # Go 1.22 on same foreign arch — expected to SUCCEED (control)
+  go122-arm64-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU user-mode emulation
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Build Go 1.22 for linux/arm64 (EXPECTED TO SUCCEED)"
+        run: |
+          echo "::notice::Go 1.22 should build fine — no eventfd issue."
+          docker buildx build \
+            --platform linux/arm64 \
+            -f Dockerfile.repro-go1.22 \
+            --progress=plain \
+            .
+
+      - name: Report result
+        if: success()
+        run: |
+          echo "## Result: CONTROL PASSED" >> "$GITHUB_STEP_SUMMARY"
+          echo "Go 1.22 cross-compilation for arm64 completed successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo "This confirms the issue is specific to Go 1.23+ under QEMU." >> "$GITHUB_STEP_SUMMARY"
+
+  # Native arch — expected to SUCCEED (proves Go 1.23 itself is fine)
+  go123-native-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Build Go 1.23 for linux/amd64 (native, EXPECTED TO SUCCEED)"
+        run: |
+          echo "::notice::Native arch build — no QEMU involved."
+          docker buildx build \
+            --platform linux/amd64 \
+            -f Dockerfile.repro \
+            --progress=plain \
+            .
+
+      - name: Report result
+        if: success()
+        run: |
+          echo "## Result: NATIVE CONTROL PASSED" >> "$GITHUB_STEP_SUMMARY"
+          echo "Go 1.23 builds fine on native amd64 — no QEMU, no hang." >> "$GITHUB_STEP_SUMMARY"
+          echo "This confirms the issue is QEMU-specific, not a Go bug." >> "$GITHUB_STEP_SUMMARY"

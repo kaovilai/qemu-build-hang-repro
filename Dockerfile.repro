@@ -1,0 +1,15 @@
+# Minimal repro: Go 1.23 compilation hangs under QEMU user-mode emulation
+# Build with: docker buildx build --platform linux/arm64 -f Dockerfile.repro .
+# Or:         podman build --platform linux/arm64 -f Dockerfile.repro .
+
+FROM golang:1.23 AS builder
+
+WORKDIR /app
+COPY main.go .
+# This compilation step triggers the QEMU eventfd deadlock
+# when running under qemu-user for a foreign architecture.
+RUN go build -o /app/hello main.go
+
+FROM scratch
+COPY --from=builder /app/hello /hello
+ENTRYPOINT ["/hello"]
